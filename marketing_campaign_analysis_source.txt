@@ -1,0 +1,265 @@
+"""
+Marketing Campaign Customer Analysis
+------------------------------------
+Run:
+    python marketing_campaign_analysis.py
+    python marketing_campaign_analysis.py --data marketing_campaign.csv --output results
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy import stats
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+
+
+SPENDING_COLUMNS = [
+    "MntWines", "MntFruits", "MntMeatProducts",
+    "MntFishProducts", "MntSweetProducts", "MntGoldProds",
+]
+PURCHASE_COLUMNS = [
+    "NumStorePurchases", "NumCatalogPurchases",
+    "NumWebPurchases", "NumDealsPurchases",
+]
+NUMERIC_COLUMNS = [
+    "Income", "Recency", "Age", *SPENDING_COLUMNS,
+    *PURCHASE_COLUMNS, "NumWebVisitsMonth",
+]
+CAMPAIGN_COLUMNS = [
+    "AcceptedCmp1", "AcceptedCmp2", "AcceptedCmp3",
+    "AcceptedCmp4", "AcceptedCmp5",
+]
+
+
+def load_and_clean_data(csv_path: Path) -> pd.DataFrame:
+    """Load the CSV and perform the cleaning steps used in the project."""
+    df = pd.read_csv(csv_path)
+
+    if "Income" in df.columns:
+        df["Income"] = df["Income"].fillna(df["Income"].mean())
+
+    if "Dt_Customer" in df.columns:
+        # Dataset dates are commonly stored as day-month-year.
+        dates = pd.to_datetime(df["Dt_Customer"], format="%d-%m-%Y", errors="coerce")
+        if dates.isna().all():
+            dates = pd.to_datetime(df["Dt_Customer"], errors="coerce")
+        df["Dt_Customer"] = dates
+
+    for column in ("Education", "Marital_Status"):
+        if column in df.columns:
+            df[column] = df[column].astype("category")
+
+    for column in CAMPAIGN_COLUMNS + ["Complain"]:
+        if column in df.columns:
+            # Keep missing values as missing rather than converting them to True.
+            df[column] = df[column].map(
+                lambda value: bool(value) if pd.notna(value) else np.nan
+            )
+
+    return df
+
+
+def detect_outliers(df: pd.DataFrame, numeric_columns: list[str], output_dir: Path) -> None:
+    available = [c for c in numeric_columns if c in df.columns]
+    if not available:
+        return
+
+    numeric = df[available].apply(pd.to_numeric, errors="coerce")
+
+    q1 = numeric.quantile(0.25)
+    q3 = numeric.quantile(0.75)
+    iqr = q3 - q1
+    iqr_outliers = (numeric < (q1 - 1.5 * iqr)) | (numeric > (q3 + 1.5 * iqr))
+    print("\nOutlier count per column (IQR method):")
+    print(iqr_outliers.sum())
+
+    # Z-scores are calculated column-wise to avoid dropping an entire row
+    # when only one variable is missing.
+    z_scores = numeric.apply(
+        lambda col: (col - col.mean()) / col.std(ddof=0)
+        if col.std(ddof=0) not in (0, np.nan) else np.nan
+    )
+    z_outliers = z_scores.abs() > 3
+    print("\nOutlier count per column (|Z| > 3):")
+    print(z_outliers.sum())
+
+    pd.DataFrame({
+        "IQR_outlier_count": iqr_outliers.sum(),
+        "Z_score_outlier_count": z_outliers.sum(),
+    }).to_csv(output_dir / "outlier_summary.csv")
+
+
+def create_features(df: pd.DataFrame) -> pd.DataFrame:
+    spend_cols = [c for c in SPENDING_COLUMNS if c in df.columns]
+    purchase_cols = [c for c in PURCHASE_COLUMNS if c in df.columns]
+
+    if spend_cols:
+        df["total_spent"] = df[spend_cols].sum(axis=1)
+    if purchase_cols:
+        df["Total_Purchase"] = df[purchase_cols].sum(axis=1)
+    return df
+
+
+def descriptive_statistics(df: pd.DataFrame, output_dir: Path) -> None:
+    available = [c for c in NUMERIC_COLUMNS if c in df.columns]
+    if not available:
+        return
+
+    summary = df[available].describe(
+        percentiles=[0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
+    ).T
+    summary["median"] = df[available].median()
+    summary["IQR"] = summary["75%"] - summary["25%"]
+    summary["skewness"] = df[available].skew()
+    summary["kurtosis"] = df[available].kurtosis()
+    summary = summary.round(2)
+    print("\nDescriptive statistics:")
+    print(summary)
+    summary.to_csv(output_dir / "descriptive_statistics.csv")
+
+
+def correlation_analysis(df: pd.DataFrame, output_dir: Path) -> None:
+    requested = ["Income", "Z_Revenue", "Age", "Recency", "NumWebVisitsMonth"]
+    available = [c for c in requested if c in df.columns]
+    if len(available) >= 2:
+        corr = df[available].corr(method="pearson")
+        print("\nPearson correlation:")
+        print(corr)
+        corr.to_csv(output_dir / "pearson_correlation.csv")
+
+
+def statistical_analysis(df: pd.DataFrame) -> None:
+    if "total_spent" in df.columns:
+        spending = df["total_spent"].dropna()
+        if len(spending) > 1:
+            ci = stats.t.interval(
+                0.95, len(spending) - 1,
+                loc=spending.mean(),
+                scale=stats.sem(spending),
+            )
+            print(f"\n95% confidence interval for mean customer spending: {ci}")
+
+    if {"total_spent", "Total_Purchase"}.issubset(df.columns):
+        model_data = df[["total_spent", "Total_Purchase"]].dropna()
+        if len(model_data) >= 2:
+            X = model_data[["total_spent"]]
+            y = model_data["Total_Purchase"]
+            model = LinearRegression().fit(X, y)
+            predictions = model.predict(X)
+            print("\nLinear regression: Total_Purchase predicted from total_spent")
+            print("Intercept:", model.intercept_)
+            print("Slope:", model.coef_[0])
+            print("R-squared:", r2_score(y, predictions))
+
+    # Compare Response values for customers who accepted each campaign.
+    if "Response" in df.columns:
+        campaign_cols = [c for c in CAMPAIGN_COLUMNS if c in df.columns]
+        groups = [
+            pd.to_numeric(df.loc[df[c] == True, "Response"], errors="coerce").dropna()
+            for c in campaign_cols
+        ]
+        groups = [g for g in groups if len(g) > 1]
+        if len(groups) >= 2:
+            f_stat, p_value = stats.f_oneway(*groups)
+            print("\nANOVA comparing Response values among campaign-acceptance groups")
+            print("F-statistic:", f_stat)
+            print("p-value:", p_value)
+            print("Note: campaign groups can overlap, so interpret this comparison cautiously.")
+
+
+def make_plots(df: pd.DataFrame, output_dir: Path) -> None:
+    sns.set_theme(style="whitegrid")
+
+    if "Income" in df.columns:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        sns.histplot(df["Income"].dropna(), kde=True, ax=ax)
+        ax.set_title("Income Distribution")
+        fig.tight_layout()
+        fig.savefig(output_dir / "income_distribution.png", dpi=150)
+        plt.close(fig)
+
+    if "total_spent" in df.columns:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        sns.boxplot(x=df["total_spent"], ax=ax)
+        ax.set_title("Total Customer Spending")
+        fig.tight_layout()
+        fig.savefig(output_dir / "total_spent_boxplot.png", dpi=150)
+        plt.close(fig)
+
+    if "Response" in df.columns:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        sns.countplot(data=df, x="Response", ax=ax)
+        ax.set_title("Campaign Response Counts")
+        ax.set_xlabel("Response")
+        ax.set_ylabel("Number of Customers")
+        fig.tight_layout()
+        fig.savefig(output_dir / "campaign_response_counts.png", dpi=150)
+        plt.close(fig)
+
+    if {"Income", "total_spent"}.issubset(df.columns):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        sns.scatterplot(data=df, x="Income", y="total_spent", alpha=0.5, ax=ax)
+        ax.set_title("Income vs Total Spending")
+        fig.tight_layout()
+        fig.savefig(output_dir / "income_vs_spending.png", dpi=150)
+        plt.close(fig)
+
+    if {"Dt_Customer"}.issubset(df.columns):
+        dates = df.dropna(subset=["Dt_Customer"]).set_index("Dt_Customer")
+        if not dates.empty:
+            monthly = dates.resample("ME").size()
+            fig, ax = plt.subplots(figsize=(7, 4))
+            monthly.plot(kind="line", marker="o", ax=ax)
+            ax.set_title("Customer Enrollment Trend")
+            ax.set_xlabel("Enrollment month")
+            ax.set_ylabel("New customers")
+            fig.tight_layout()
+            fig.savefig(output_dir / "customer_acquisition_trend.png", dpi=150)
+            plt.close(fig)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Analyze marketing campaign customer data.")
+    parser.add_argument("--data", default="marketing_campaign.csv",
+                        help="Path to the marketing campaign CSV file.")
+    parser.add_argument("--output", default="results",
+                        help="Folder in which summaries and charts will be saved.")
+    args = parser.parse_args()
+
+    csv_path = Path(args.data)
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {csv_path}. Place marketing_campaign.csv beside the script "
+            "or pass its location with --data."
+        )
+
+    df = load_and_clean_data(csv_path)
+    print("Dataset shape:", df.shape)
+    print("\nDataset information:")
+    print(df.info())
+    print("\nMissing values after cleaning:")
+    print(df.isnull().sum())
+
+    df = create_features(df)
+    detect_outliers(df, NUMERIC_COLUMNS, output_dir)
+    descriptive_statistics(df, output_dir)
+    correlation_analysis(df, output_dir)
+    statistical_analysis(df)
+    make_plots(df, output_dir)
+
+    df.to_csv(output_dir / "cleaned_marketing_campaign.csv", index=False)
+    print(f"\nAnalysis complete. Results saved in: {output_dir.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
